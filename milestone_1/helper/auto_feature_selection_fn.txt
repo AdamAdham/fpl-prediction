@@ -1,0 +1,284 @@
+import json
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+import pickle
+
+# ==========================================
+# FFNN Model Definition
+# ==========================================
+class FFNN(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        n_layers=3,
+        n_units_l0=218,
+        n_units_l1=233,
+        n_units_l2=70,
+        dropout_rate=0.10236066118288575,
+    ):
+        super(FFNN, self).__init__()
+        layers = []
+        in_dim = input_dim
+        hidden_units = [n_units_l0, n_units_l1, n_units_l2][:n_layers]
+
+        for h in hidden_units:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            in_dim = h
+
+        layers.append(nn.Linear(in_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ==========================================
+# Training Function
+# ==========================================
+def train_and_evaluate(X_train, X_test, y_train, y_test, epochs=100, 
+                       early_stop_patience=10, early_stop_min_delta=0.001):
+    """
+    Train FFNN model with early stopping and return evaluation metrics
+    
+    Args:
+        early_stop_patience: Number of epochs to wait for improvement
+        early_stop_min_delta: Minimum change in validation loss to qualify as improvement
+    """
+    
+    # Ensure all inputs are numpy arrays with correct shapes
+    X_train = np.array(X_train)
+    X_test = np.array(X_test)
+    y_train = np.array(y_train).flatten()
+    y_test = np.array(y_test).flatten()
+    
+    # Convert to torch tensors
+    X_train_t = torch.tensor(X_train, dtype=torch.float32)
+    X_test_t = torch.tensor(X_test, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+    y_test_t = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
+    
+    # Create Dataloaders
+    train_data = TensorDataset(X_train_t, y_train_t)
+    test_data = TensorDataset(X_test_t, y_test_t)
+    train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
+    test_loader = DataLoader(test_data, batch_size=64, shuffle=False)
+    
+    # Best hyperparameters from Optuna
+    best_params = {
+        "n_layers": 4,
+        "n_units_l0": 510,
+        "n_units_l1": 241,
+        "n_units_l2": 222,
+        "dropout_rate": 0.281975287168578,
+        "lr": 0.00019165928146882533,
+    }
+    
+    # Initialize model
+    model = FFNN(
+        input_dim=X_train.shape[1],
+        n_layers=best_params["n_layers"],
+        n_units_l0=best_params["n_units_l0"],
+        n_units_l1=best_params["n_units_l1"],
+        n_units_l2=best_params["n_units_l2"],
+        dropout_rate=best_params["dropout_rate"],
+    )
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=best_params["lr"])
+    criterion = nn.MSELoss()
+    
+    # Early stopping variables
+    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    
+    # Train with early stopping
+    for epoch in range(epochs):
+        # Training phase
+        model.train()
+        total_train_loss = 0
+        for xb, yb in train_loader:
+            optimizer.zero_grad()
+            preds = model(xb)
+            loss = criterion(preds, yb)
+            loss.backward()
+            optimizer.step()
+            total_train_loss += loss.item()
+        
+        avg_train_loss = total_train_loss / len(train_loader)
+        
+        # Validation phase
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for xb, yb in test_loader:
+                preds = model(xb)
+                loss = criterion(preds, yb)
+                total_val_loss += loss.item()
+        
+        avg_val_loss = total_val_loss / len(test_loader)
+        
+        # Early stopping check
+        if avg_val_loss < best_val_loss - early_stop_min_delta:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+        
+        # Print progress every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            print(f"  Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Patience: {patience_counter}/{early_stop_patience}")
+        
+        # Stop if patience exceeded
+        if patience_counter >= early_stop_patience:
+            print(f"  ⏹️  Early stopping at epoch {epoch+1}. Best val loss: {best_val_loss:.4f}")
+            model.load_state_dict(best_model_state)
+            break
+    
+    # If we completed all epochs without early stopping
+    if patience_counter < early_stop_patience and best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"  ✓ Completed {epochs} epochs. Best val loss: {best_val_loss:.4f}")
+    
+    # Final evaluation
+    model.eval()
+    with torch.no_grad():
+        preds = model(X_test_t)
+        preds_np = preds.cpu().numpy()
+        y_test_np = y_test_t.cpu().numpy()
+        
+        # Compute metrics
+        mse = mean_squared_error(y_test_np, preds_np)
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(y_test_np, preds_np)
+        r2 = r2_score(y_test_np, preds_np)
+    
+    return {
+        "mae": float(mae),
+        "mse": float(mse),
+        "rmse": float(rmse),
+        "r2": float(r2)
+    }
+
+
+# ==========================================
+# MAIN AUTOMATION LOOP
+# ==========================================
+def run_feature_selection_experiment(df, target_col="upcoming_total_points", 
+                                     output_file="feature_selection_results.json"):
+    """
+    Run feature selection for all possible n_features values and save results
+    """
+    
+    # Prepare data
+    X = df.drop(columns=[target_col])
+    y = df[target_col]
+    
+    max_features = X.shape[1]
+    print(f"Total features available: {max_features}")
+    print(f"Testing n_features from 2 to {max_features}...\n")
+    
+    # Standardize
+    scaler_full = StandardScaler()
+    X_scaled = scaler_full.fit_transform(X)
+    X_scaled = pd.DataFrame(X_scaled, columns=X.columns)
+    
+    # Feature importance analysis (run once)
+    print("Computing feature importance scores...")
+    corr = df.corr()[target_col].sort_values(ascending=False)
+    
+    selector = SelectKBest(score_func=f_regression, k='all')
+    selector.fit(X_scaled, y)
+    scores = pd.Series(selector.scores_, index=X.columns).sort_values(ascending=False)
+    
+    # Combine scores
+    results_df = pd.DataFrame({
+        "Correlation": corr,
+        "F_test": scores,
+    }).fillna(0)
+    
+    # Normalize scores
+    results_df = results_df.apply(lambda x: (x - x.min()) / (x.max() - x.min()))
+    results_df["Combined_Score"] = results_df.mean(axis=1)
+    results_df = results_df.drop(index=target_col, errors="ignore")
+    results_df = results_df.sort_values("Combined_Score", ascending=False)
+
+    
+    # Store all results
+    all_results = []
+    
+    # Loop through all possible n_features
+    # Inside run_feature_selection_experiment, around line 240
+    for n_features in range(2, max_features + 1):
+        print(f"\n{'='*60}")
+        print(f"Testing with n_features = {n_features}")
+        print(f"{'='*60}")
+        
+        # Select top features
+        top_features = results_df.head(n_features).index.tolist()
+        df_selected = df[top_features + [target_col]]
+        
+        # Prepare training data
+        y_current = df_selected[target_col].values
+        X_current = df_selected.drop(columns=[target_col]).values
+        
+        # Train/Test split
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_current, y_current, test_size=0.2, random_state=42
+        )
+        
+        # Scale data
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Train and evaluate
+        metrics = train_and_evaluate(X_train_scaled, X_test_scaled, y_train, y_test)
+        
+        # Store results
+        result_entry = {
+            "n_features": n_features,
+            "selected_features": top_features,
+            "metrics": metrics
+        }
+        all_results.append(result_entry)
+        
+        # Print metrics
+        print(f"MAE:  {metrics['mae']:.4f}")
+        print(f"MSE:  {metrics['mse']:.4f}")
+        print(f"RMSE: {metrics['rmse']:.4f}")
+        print(f"R²:   {metrics['r2']:.4f}")
+    
+    # Find and display best configuration
+    best_mae = min(all_results, key=lambda x: x['metrics']['mae'])
+    best_r2 = max(all_results, key=lambda x: x['metrics']['r2'])
+    
+    print(f"\n{'='*60}")
+    print(f"✅ All results saved to {output_file}")
+    print(f"{'='*60}")
+    
+    print(f"\n📊 SUMMARY:")
+    print(f"\nBest MAE: {best_mae['metrics']['mae']:.4f} with {best_mae['n_features']} features")
+    print(f"Best R²:  {best_r2['metrics']['r2']:.4f} with {best_r2['n_features']} features")
+    
+    # Save results to JSON (after plotting so we have complete results)
+    with open(output_file, 'w') as f:
+        json.dump(all_results, f, indent=2)
+    
+    return all_results
+
+
+# ==========================================
+# RUN THE EXPERIMENT
+# ==========================================
+# Assuming 'df' is your dataframe with all features
+# 
+# Default run (early stopping during training with patience=10, min_delta=0.001):
+results = run_feature_selection_experiment(df)
